@@ -1,6 +1,5 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import "pixi-spine";
   import { Spine, SpineTexture } from "@esotericsoftware/spine-pixi";
   import { Vector2 } from "@esotericsoftware/spine-core";
   import type { Bone, Event as SpineEvent, TrackEntry } from "@esotericsoftware/spine-core";
