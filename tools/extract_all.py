@@ -76,6 +76,22 @@ class FlatBufferTable:
         length = struct.unpack_from("<I", self.data, target)[0]
         return list(struct.unpack_from(f"<{length}I", self.data, target + 4))
 
+    def string_vector(self, index: int) -> list[str]:
+        pos = self._field(index)
+        if pos is None:
+            return []
+        rel = struct.unpack_from("<I", self.data, pos)[0]
+        vec_pos = pos + rel
+        length = struct.unpack_from("<I", self.data, vec_pos)[0]
+        result = []
+        for i in range(length):
+            elem_pos = vec_pos + 4 + i * 4
+            elem_rel = struct.unpack_from("<I", self.data, elem_pos)[0]
+            str_pos = elem_pos + elem_rel
+            str_len = struct.unpack_from("<I", self.data, str_pos)[0]
+            result.append(self.data[str_pos + 4 : str_pos + 4 + str_len].decode("utf-8", errors="ignore"))
+        return result
+
 
 DIALOG_CATEGORIES = """
 Cafe Echelon CharacterSSRNew CharacterGet Birthday Dating Title UILobby
@@ -181,7 +197,17 @@ def read_character(record: bytes) -> dict[str, Any]:
     }
 
 
-def export_tables(db_path: Path, key: str, out_dirs: list[Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def read_bgm(record: bytes) -> dict[str, Any]:
+    t = FlatBufferTable(record)
+    paths = t.string_vector(2)
+    return {
+        "Id": t.scalar(0, "<q", 0),
+        "ProductionStep": t.scalar(1, "<i", 0),
+        "Path": paths[0] if paths else ""
+    }
+
+
+def export_tables(db_path: Path, key: str, out_dirs: list[Path]) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     print("Exporting database tables from ExcelDB.db...")
     import sqlcipher3.dbapi2 as sqlite
 
@@ -197,6 +223,13 @@ def export_tables(db_path: Path, key: str, out_dirs: list[Path]) -> tuple[list[d
     cursor = conn.execute('SELECT "Bytes" FROM "CharacterDBSchema" ORDER BY rowid')
     characters = [read_character(row[0]) for row in cursor]
 
+    bgms: list[dict[str, Any]] = []
+    try:
+        cursor = conn.execute('SELECT "Bytes" FROM "BGMDBSchema" ORDER BY rowid')
+        bgms = [read_bgm(row[0]) for row in cursor]
+    except Exception as e:
+        print(f"Warning: could not export BGMDBSchema ({e})")
+
     for out_dir in out_dirs:
         out_dir.mkdir(parents=True, exist_ok=True)
         with open(out_dir / "CharacterDialogExcelTable.json", "w", encoding="utf-8") as f:
@@ -205,9 +238,12 @@ def export_tables(db_path: Path, key: str, out_dirs: list[Path]) -> tuple[list[d
             json.dump(lobbies, f, indent=2)
         with open(out_dir / "CharacterExcelTable.json", "w", encoding="utf-8") as f:
             json.dump(characters, f, indent=2)
+        if bgms:
+            with open(out_dir / "BGMExcelTable.json", "w", encoding="utf-8") as f:
+                json.dump(bgms, f, indent=2)
 
-    print(f"Exported {len(dialogs)} dialogs, {len(lobbies)} memory lobbies, and {len(characters)} characters to TableBundles.")
-    return dialogs, lobbies, characters
+    print(f"Exported {len(dialogs)} dialogs, {len(lobbies)} memory lobbies, {len(characters)} characters, and {len(bgms)} BGMs to TableBundles.")
+    return dialogs, lobbies, characters, bgms
 
 
 # ---------------------------------------------------------------------------
@@ -246,13 +282,80 @@ def decode_streamed_clip_clean(data_list: list[int]) -> list[dict[str, Any]]:
     return keyframes
 
 
-def index_audio_clips(game_android: Path) -> dict[int, tuple[str, bytes]]:
-    print("Indexing audio clips across game audio bundles...")
-    audio_bundles = glob.glob(str(game_android / "*audio*.bundle"))
-    audio_bundles += glob.glob(str(game_android / "*spinelobbies*.wav*.bundle"))
-    audio_map: dict[int, tuple[str, bytes]] = {}
+def resolve_external_cab_audio(
+    cab_name: str,
+    path_id: int,
+    game_android: Path,
+    preload_android: Optional[Path],
+    cab_bundle_cache: dict[str, str],
+    audio_map: dict[int, tuple[str, bytes]],
+    name_map: dict[str, tuple[str, bytes]],
+) -> tuple[str, bytes] | None:
+    if path_id in audio_map:
+        return audio_map[path_id]
 
-    for b in audio_bundles:
+    bundle_path = cab_bundle_cache.get(cab_name)
+    if not bundle_path:
+        cab_bytes = cab_name.encode("utf-8")
+        roots = [game_android]
+        if preload_android and preload_android.is_dir():
+            roots.append(preload_android)
+        for r in roots:
+            for f in os.listdir(r):
+                fl = f.lower()
+                if "dependency" in fl or "prolog" in fl or "common" in fl or "audio" in fl:
+                    full = os.path.join(r, f)
+                    try:
+                        with open(full, "rb") as fp:
+                            if cab_bytes in fp.read(4096):
+                                bundle_path = full
+                                cab_bundle_cache[cab_name] = full
+                                break
+                    except Exception:
+                        pass
+            if bundle_path:
+                break
+
+    if bundle_path:
+        try:
+            env = UnityPy.load(bundle_path)
+            for o in env.objects:
+                if o.type.name == "AudioClip":
+                    d = o.read()
+                    name = getattr(d, "m_Name", "")
+                    samples = getattr(d, "samples", {})
+                    if samples:
+                        sname, sdata = next(iter(samples.items()))
+                        audio_map[o.path_id] = (name, sdata)
+                        name_map[name.lower()] = (name, sdata)
+        except Exception:
+            pass
+
+    return audio_map.get(path_id)
+
+
+def index_audio_clips(
+    game_android: Path, preload_android: Optional[Path] = None
+) -> tuple[dict[int, tuple[str, bytes]], dict[str, tuple[str, bytes]]]:
+    print("Indexing audio clips across game audio bundles and preload bundles...")
+    candidate_bundles = []
+    roots = [game_android]
+    if preload_android and preload_android.is_dir():
+        roots.append(preload_android)
+
+    for r in roots:
+        for f in os.listdir(r):
+            fl = f.lower()
+            if any(w in fl for w in ["audio", "wav", "sfx", "sound"]):
+                candidate_bundles.append(os.path.join(r, f))
+            elif "common" in fl and ("spine" in fl or "character" in fl or "prolog" in fl):
+                candidate_bundles.append(os.path.join(r, f))
+
+    candidate_bundles = sorted(set(candidate_bundles))
+    audio_map: dict[int, tuple[str, bytes]] = {}
+    name_map: dict[str, tuple[str, bytes]] = {}
+
+    for b in candidate_bundles:
         try:
             env = UnityPy.load(b)
             for o in env.objects:
@@ -263,10 +366,11 @@ def index_audio_clips(game_android: Path) -> dict[int, tuple[str, bytes]]:
                     if samples:
                         sname, sdata = next(iter(samples.items()))
                         audio_map[o.path_id] = (name, sdata)
+                        name_map[name.lower()] = (name, sdata)
         except Exception:
             pass
-    print(f"Indexed {len(audio_map)} unique AudioClips.")
-    return audio_map
+    print(f"Indexed {len(audio_map)} unique AudioClips ({len(name_map)} by name) across {len(candidate_bundles)} bundles.")
+    return audio_map, name_map
 
 
 def find_all_character_bundles(game_android: Path) -> dict[str, list[str]]:
@@ -289,13 +393,45 @@ def extract_character_l2d_and_timeline(
     char_bundles: list[str],
     char_key: str,
     target_dirs: list[Path],
-    audio_index: dict[int, tuple[str, bytes]],
+    audio_index: tuple[dict[int, tuple[str, bytes]], dict[str, tuple[str, bytes]]],
     interaction_data: dict[str, Any] | None,
+    game_android: Optional[Path] = None,
+    preload_android: Optional[Path] = None,
+    cab_bundle_cache: Optional[dict[str, str]] = None,
     force: bool = False
 ) -> dict[str, Any] | None:
     """Extract Live2D .skel, .atlas, .png textures, effects.json, and audio cues."""
     for tdir in target_dirs:
         tdir.mkdir(parents=True, exist_ok=True)
+
+    audio_map, name_map = audio_index
+    if cab_bundle_cache is None:
+        cab_bundle_cache = {}
+
+    char_audio_map: dict[int, tuple[str, bytes]] = {}
+    char_name_map: dict[str, tuple[str, bytes]] = {}
+
+    clean_char = char_key.replace("_home", "").replace("_teen", "").replace("_multi", "")
+    base_char = clean_char.split("_")[0]
+    if game_android and game_android.is_dir():
+        dep_patterns = [f"assets-_mx-characters-{clean_char}*.bundle", f"assets-_mx-characters-{base_char}*.bundle"]
+        for dp in dep_patterns:
+            for b in glob.glob(str(game_android / dp)):
+                if b in char_bundles:
+                    continue
+                try:
+                    env = UnityPy.load(b)
+                    for o in env.objects:
+                        if o.type.name == "AudioClip":
+                            d = o.read()
+                            cname = getattr(d, "m_Name", "")
+                            samples = getattr(d, "samples", {})
+                            if samples:
+                                sname, sdata = next(iter(samples.items()))
+                                char_audio_map[o.path_id] = (cname, sdata)
+                                char_name_map[cname.lower()] = (cname, sdata)
+                except Exception:
+                    pass
 
     timeline_data: dict[str, Any] | None = None
     timeline_bundle_env: Any = None
@@ -307,8 +443,20 @@ def extract_character_l2d_and_timeline(
             continue
 
         for o in env.objects:
+            if o.type.name == "AudioClip":
+                try:
+                    d = o.read()
+                    name = getattr(d, "m_Name", "")
+                    samples = getattr(d, "samples", {})
+                    if samples:
+                        sname, sdata = next(iter(samples.items()))
+                        char_audio_map[o.path_id] = (name, sdata)
+                        char_name_map[name.lower()] = (name, sdata)
+                except Exception:
+                    pass
+
             # 1. Live2D TextAsset (.skel and .atlas)
-            if o.type.name == "TextAsset":
+            elif o.type.name == "TextAsset":
                 d = o.read()
                 name = getattr(d, "m_Name", "")
                 if not name:
@@ -353,6 +501,15 @@ def extract_character_l2d_and_timeline(
 
     # Parse timeline from identified environment
     if timeline_bundle_env:
+        externals: list[str] = []
+        for bf in getattr(timeline_bundle_env, "files", {}).values():
+            if hasattr(bf, "files"):
+                for sf in bf.files.values():
+                    if hasattr(sf, "externals"):
+                        externals = [ext.path.split("/")[-1] for ext in sf.externals]
+                        if externals:
+                            break
+
         obj_map = {o.path_id: o for o in timeline_bundle_env.objects}
         timeline_obj = None
         for o in timeline_bundle_env.objects:
@@ -416,8 +573,29 @@ def extract_character_l2d_and_timeline(
                         if "AudioData" in ad:
                             adata = ad.get("AudioData", {})
                             clips_list = adata.get("AudioClips", [])
-                            clip_pid = clips_list[0].get("m_PathID") if clips_list else None
-                            audio_entry = audio_index.get(clip_pid) if clip_pid else None
+                            clip_ref = clips_list[0] if clips_list else {}
+                            clip_fid = clip_ref.get("m_FileID", 0)
+                            clip_pid = clip_ref.get("m_PathID")
+
+                            audio_entry = None
+                            if clip_pid:
+                                audio_entry = char_audio_map.get(clip_pid) or audio_map.get(clip_pid)
+                                if not audio_entry and clip_fid > 0 and clip_fid <= len(externals) and game_android:
+                                    cab_name = externals[clip_fid - 1]
+                                    audio_entry = resolve_external_cab_audio(
+                                        cab_name,
+                                        clip_pid,
+                                        game_android,
+                                        preload_android,
+                                        cab_bundle_cache,
+                                        audio_map,
+                                        name_map,
+                                    )
+                            if not audio_entry and clip_name:
+                                audio_entry = char_name_map.get(clip_name.lower()) or name_map.get(clip_name.lower())
+                            if not audio_entry and "m_Name" in ad:
+                                ad_name = ad.get("m_Name", "")
+                                audio_entry = char_name_map.get(ad_name.lower()) or name_map.get(ad_name.lower())
 
                             audio_clip_info: dict[str, Any] = {}
                             if audio_entry:
@@ -427,7 +605,7 @@ def extract_character_l2d_and_timeline(
                                     audio_out_dir = tdir / "audio"
                                     audio_out_dir.mkdir(parents=True, exist_ok=True)
                                     wav_path = audio_out_dir / source_file
-                                    if not wav_path.exists():
+                                    if force or not wav_path.exists():
                                         with open(wav_path, "wb") as wf:
                                             wf.write(sfx_bytes)
                                 audio_clip_info = {
@@ -513,7 +691,21 @@ def generate_info_json(directory: Path, prefix: str) -> dict[str, list[str]]:
                 return 2
             return 3
 
-        sorted_skels = sorted(skels, key=lambda s: (score(s), s.lower()))
+        valid_skels = []
+        for s in skels:
+            s_lower = s.lower()
+            # Skip intro-only cutscene overlay skeletons (_00.skel, _01.skel)
+            if re.search(r"_\d{2}\.skel$", s_lower):
+                continue
+            # Skip skeletons belonging to completely different characters
+            if not any(k in s_lower for k in [char_base, "bg", "scene", "background"]):
+                continue
+            valid_skels.append(s)
+
+        if not valid_skels:
+            valid_skels = skels
+
+        sorted_skels = sorted(valid_skels, key=lambda s: (score(s), s.lower()))
         info[d] = [f"{prefix}/{d}/{s}" for s in sorted_skels]
     return info
 
@@ -548,23 +740,30 @@ def extract_bgm(
     table_dir: Path,
     memory_lobbies: Optional[list[dict[str, Any]]] = None,
     characters: Optional[list[dict[str, Any]]] = None,
+    bgms: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
-    print("Extracting BGM tracks and building Memorial Lobby BGM map...")
-    theme_files = sorted(media_dir.glob("Theme_*.ogg")) + sorted(media_dir.glob("BGM_*.ogg"))
-    extracted_count = 0
-    for bd in bgm_dirs:
-        bd.mkdir(parents=True, exist_ok=True)
-        for tf in theme_files:
-            target = bd / tf.name
-            if not target.exists():
-                shutil.copy2(tf, target)
-                extracted_count += 1
-    if extracted_count:
-        print(f"Copied {extracted_count} BGM files across output directories.")
+    print("Extracting BGM tracks and building Memorial Lobby BGM map from tables...")
 
     # Load tables if not provided
+    if not bgms:
+        bgm_file = table_dir / "BGMExcelTable.json"
+        if not bgm_file.is_file() and (table_dir.parent / "Excel" / "BGMExcelTable.json").is_file():
+            bgm_file = table_dir.parent / "Excel" / "BGMExcelTable.json"
+        if bgm_file.is_file():
+            try:
+                with open(bgm_file, "r", encoding="utf-8") as f:
+                    bgms = json.load(f)
+            except Exception:
+                bgms = []
+        else:
+            bgms = []
+
+    bgm_table_map = {b["Id"]: b for b in (bgms or [])}
+
     if not memory_lobbies:
         lobby_file = table_dir / "MemoryLobbyExcelTable.json"
+        if not lobby_file.is_file() and (table_dir.parent / "Excel" / "MemoryLobbyExcelTable.json").is_file():
+            lobby_file = table_dir.parent / "Excel" / "MemoryLobbyExcelTable.json"
         if lobby_file.is_file():
             try:
                 with open(lobby_file, "r", encoding="utf-8") as f:
@@ -576,6 +775,8 @@ def extract_bgm(
 
     if not characters:
         char_file = table_dir / "CharacterExcelTable.json"
+        if not char_file.is_file() and (table_dir.parent / "Excel" / "CharacterExcelTable.json").is_file():
+            char_file = table_dir.parent / "Excel" / "CharacterExcelTable.json"
         if char_file.is_file():
             try:
                 with open(char_file, "r", encoding="utf-8") as f:
@@ -586,6 +787,36 @@ def extract_bgm(
             characters = []
 
     char_map = {c["Id"]: c for c in (characters or [])}
+
+    # Discover and copy all BGM tracks
+    media_ogg_map: dict[str, Path] = {}
+    if media_dir.is_dir():
+        for ogg in media_dir.glob("*.ogg"):
+            media_ogg_map[ogg.name.lower()] = ogg
+
+    target_filenames: set[str] = set()
+    for b in (bgms or []):
+        p = b.get("Path", "")
+        if p:
+            target_filenames.add(f"{os.path.basename(p)}.ogg".lower())
+
+    for pat in ["Theme_*.ogg", "BGM_*.ogg", "AMB_*.ogg", "BlueNewWorld_*.ogg", "TargetForLove*.ogg", "ClearMorning_*.ogg", "*Sound.ogg"]:
+        for tf in media_dir.glob(pat):
+            target_filenames.add(tf.name.lower())
+
+    extracted_count = 0
+    for bd in bgm_dirs:
+        bd.mkdir(parents=True, exist_ok=True)
+        for low_name in target_filenames:
+            src = media_ogg_map.get(low_name)
+            if src:
+                target = bd / src.name
+                if not target.exists():
+                    shutil.copy2(src, target)
+                    extracted_count += 1
+    if extracted_count:
+        print(f"Copied {extracted_count} BGM files across output directories.")
+
     bgm_map: dict[str, Any] = {}
 
     for lobby in (memory_lobbies or []):
@@ -595,10 +826,16 @@ def extract_bgm(
             continue
         c_info = char_map.get(cid, {})
         dev_name = (c_info.get("DevName") or "").lower()
-        if bgm_id == 10004 or cid == 20007:
+        prefab = (lobby.get("PrefabName") or "").lower()
+
+        bgm_entry = bgm_table_map.get(bgm_id)
+        if bgm_entry and bgm_entry.get("Path"):
+            theme_name = f"{os.path.basename(bgm_entry['Path'])}.ogg"
+        elif bgm_id == 10004 or cid == 20007:
             theme_name = "BGM_TellYourWorld_Short.ogg"
         else:
             theme_name = f"Theme_{bgm_id:02d}.ogg"
+
         entry = {
             "CharacterId": cid,
             "PrefabName": lobby.get("PrefabName", ""),
@@ -606,12 +843,38 @@ def extract_bgm(
             "filename": theme_name,
             "path": f"/data/MediaResources/GameData/Audio/BGM/{theme_name}"
         }
+
+        keys = set()
         if dev_name:
-            bgm_map[dev_name] = entry
-            bgm_map[f"{dev_name}_home"] = entry
+            keys.add(dev_name)
+            keys.add(f"{dev_name}_home")
+            clean_dev = dev_name[:-8] if dev_name.endswith("_default") else dev_name
+            keys.add(clean_dev)
+            keys.add(f"{clean_dev}_home")
+            keys.add(f"{clean_dev}_home_gl")
             base_dev = dev_name.split("_")[0]
-            if base_dev not in bgm_map:
-                bgm_map[base_dev] = entry
+            keys.add(base_dev)
+            keys.add(f"{base_dev}_home")
+            base_clean = clean_dev.rstrip("0123456789")
+            if base_clean:
+                keys.add(base_clean)
+                keys.add(f"{base_clean}_home")
+        if prefab:
+            keys.add(prefab)
+            clean_p = prefab.replace("lobby", "")
+            keys.add(clean_p)
+            keys.add(f"{clean_p}_home")
+            keys.add(f"{clean_p}_home_gl")
+        if cid:
+            keys.add(str(cid))
+        scen = (c_info.get("ScenarioCharacter") or "").lower()
+        if scen:
+            keys.add(scen)
+            keys.add(f"{scen}_home")
+
+        for k in keys:
+            if k:
+                bgm_map[k] = entry
 
     for bd in bgm_dirs:
         map_path = bd.parent / "bgm_map.json"
@@ -903,6 +1166,10 @@ def main() -> int:
     if not game_android.is_dir():
         game_android = input_root / "Android" if (input_root / "Android").is_dir() else input_root
 
+    preload_android = input_root / "AssetBundles" / "Preload" / "Android"
+    if not preload_android.is_dir():
+        preload_android = input_root / "Preload" / "Android" if (input_root / "Preload" / "Android").is_dir() else None
+
     db_path = input_root / "TableBundles" / "ExcelDB.db"
     if not db_path.is_file():
         db_path = input_root / "ExcelDB.db" if (input_root / "ExcelDB.db").is_file() else None
@@ -942,10 +1209,10 @@ def main() -> int:
     interaction_map_file = data_dir / "live2d-interactions.json"
 
     # 1. Export Excel tables
-    dialogs, lobbies, characters = None, None, None
+    dialogs, lobbies, characters, bgms = None, None, None, None
     if not args.skip_tables and db_path and db_path.is_file():
         try:
-            dialogs, lobbies, characters = export_tables(db_path, key, [en_table_dir, jp_table_dir])
+            dialogs, lobbies, characters, bgms = export_tables(db_path, key, [en_table_dir, jp_table_dir])
         except Exception as e:
             print(f"Table export warning: {e}")
 
@@ -960,7 +1227,7 @@ def main() -> int:
     # 2b. Extract BGM & generate bgm_map.json
     if media_dir and media_dir.is_dir():
         try:
-            extract_bgm(media_dir, bgm_dirs, en_table_dir, lobbies, characters)
+            extract_bgm(media_dir, bgm_dirs, en_table_dir, lobbies, characters, bgms)
         except Exception as e:
             print(f"BGM extraction warning: {e}")
 
@@ -1002,7 +1269,8 @@ def main() -> int:
                     json.dump(inter, out, indent=2)
 
     # 4. Extract Character Lobbies (.skel, .atlas, .png), Timelines, and Audio
-    audio_index = index_audio_clips(game_android)
+    audio_index = index_audio_clips(game_android, preload_android)
+    cab_bundle_cache: dict[str, str] = {}
     char_bundles = find_all_character_bundles(game_android)
 
     if args.character:
@@ -1029,7 +1297,15 @@ def main() -> int:
 
         try:
             res = extract_character_l2d_and_timeline(
-                b_paths, char_key, target_dirs, audio_index, char_interactions, force=args.force
+                b_paths,
+                char_key,
+                target_dirs,
+                audio_index,
+                char_interactions,
+                game_android=game_android,
+                preload_android=preload_android,
+                cab_bundle_cache=cab_bundle_cache,
+                force=args.force
             )
             if res and (processed_count % 25 == 0 or processed_count == total):
                 print(f"[{processed_count}/{total}] Processed {char_key} ({res['m_Duration']:.1f}s, {len(res['m_Tracks'])} tracks)")

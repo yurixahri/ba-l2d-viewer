@@ -88,15 +88,17 @@ python "tools/extract_all.py" -k keyxxxxx -i "E:/Games/AssetStudio/output/data" 
    - `interactions.json` touch bone IK limits and animation bindings.
 2. **Model Manifests**:
    - `info.json` mapping all 275+ characters with primary skeletons prioritized over background props.
-3. **Audio**:
-   - `BGM/`: Memorial Lobby themes (`Theme_*.ogg`) and collaboration songs (`BGM_TellYourWorld_Short.ogg`).
-   - `bgm_map.json`: Mappings from every character to their respective lobby theme.
+3. **Audio & SFX**:
+   - `BGM/`: Memorial Lobby themes (`Theme_*.ogg`, `AMB_*.ogg`, `BlueNewWorld_*.ogg`, and collaboration tracks like `BGM_TellYourWorld_Short.ogg`).
+   - `bgm_map.json`: Full database-driven mappings from every character/model key to their respective lobby theme.
+   - `<character>/audio/`: Timeline SFX audio cues extracted into `.wav` via automated Unity CAB dependency resolution.
    - `VOC_JP/` and `VOC_KR/`: Extracted voice clips.
    - `voice_sources.json`: Multi-language voice manifest.
 4. **Localization & Databases**:
    - `CharacterExcelTable.json`: Student metadata.
    - `CharacterDialogExcelTable.json`: Subtitles across EN, JP, KR, TW, TH.
    - `MemoryLobbyExcelTable.json`: Lobby-to-BGM and character associations.
+   - `BGMExcelTable.json`: Complete BGM audio paths decoded directly from `BGMDBSchema`.
 
 ---
 

@@ -46,7 +46,7 @@
 
   function applyLightOverlayEffects(spine: Spine) {
     for (const slot of spine.skeleton.slots) {
-      if (/top_?light|hardlight|screen_light|facelight|intro_.*light/i.test(slot.data.name)) {
+      if (/top_?light|hardlight|screen_?light|facelight|intro_.*light|FX_Screen|FX_SunFlare/i.test(slot.data.name)) {
         if (!playEffects) {
           slot.color.a = 0;
         } else if (slot.color.a > 0.55) {
@@ -133,6 +133,8 @@
   let lastVoiceEventAt = 0;
   let releaseVisualCompleted = false;
   let releaseActionCompleted = false;
+  let stage2Timer: ReturnType<typeof setTimeout> | undefined;
+  let isInStage2 = false;
   const animationMix = 0.2;
   const startIdleToIdleMix = 0.2;
   const endReleaseToIdleMix = 0.2;
@@ -224,8 +226,13 @@
     pitch?: number;
   };
 
+  let currentOffsetX = typeof window !== "undefined" ? window.innerWidth / 2 : 0;
+  let currentOffsetY = typeof window !== "undefined" ? window.innerHeight : 0;
+
   onMount(() => {
     if (!canvas) return;
+    currentOffsetX = window.innerWidth / 2;
+    currentOffsetY = window.innerHeight;
     app = new PIXI.Application({
       view: canvas,
       width: window.innerWidth,
@@ -233,6 +240,8 @@
       backgroundColor: 0x0a0c10,
       backgroundAlpha: 1,
       antialias: true,
+      autoDensity: true,
+      resolution: window.devicePixelRatio || 1,
     });
     lobbyEffectOverlay = new PIXI.Sprite(PIXI.Texture.WHITE);
     lobbyEffectOverlay.anchor.set(0);
@@ -244,10 +253,14 @@
     app.stage.addChild(lobbyDustLayer);
     const resize = () => {
       app?.renderer.resize(window.innerWidth, window.innerHeight);
+      if (lobbyEffectOverlay) {
+        lobbyEffectOverlay.width = window.innerWidth;
+        lobbyEffectOverlay.height = window.innerHeight;
+      }
       app?.stage.children.forEach((child) => {
         if (child === lobbyEffectOverlay || child === lobbyDustLayer || child instanceof PIXI.Graphics) return;
-        child.x = window.innerWidth / 2;
-        child.y = window.innerHeight;
+        child.x = currentOffsetX;
+        child.y = currentOffsetY;
       });
     };
     app.ticker.add(updateLobbyEffect);
@@ -855,23 +868,23 @@
         ?? spine.skeleton.bones.find((b) => /^Touch_/i.test(b.data.name))
         ?? spine.skeleton.bones[0];
       if (!anchor) return [];
-      const familyMatch = inClip.match(/^(.+?)_(\d+)_M$/i);
-      const family = familyMatch?.[1];
+      const familyMatch = inClip.match(/^([A-Za-z]+?)(?:[0-9]+)?_[0-9]+_M$/i);
+      const basePrefix = familyMatch?.[1];
       const escape = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-      const framePattern = family ? new RegExp(`^${escape(family)}_(\\d+)_M$`, "i") : undefined;
+      const framePattern = basePrefix ? new RegExp(`^${escape(basePrefix)}[0-9]*_[0-9]+_M$`, "i") : undefined;
       const frames = framePattern
         ? names
             .filter((name) => framePattern.test(name))
-            .sort((left, right) => Number(left.match(/_(\d+)_M$/i)?.[1]) - Number(right.match(/_(\d+)_M$/i)?.[1]))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
         : [inClip];
-      const endFamily = item.endClip?.replace(/(?:_?End)_\d+_M$/i, "");
-      const endPattern = endFamily
-        ? new RegExp(`^${escape(endFamily)}(?:End|_End)_?(\\d+)_M$`, "i")
+      const endPrefix = item.endClip?.replace(/(?:_?End)[0-9]*_[0-9]+_M$/i, "");
+      const endPattern = endPrefix
+        ? new RegExp(`^${escape(endPrefix)}(?:End|_End)[0-9]*_?[0-9]+_M$`, "i")
         : undefined;
       const endFrames = endPattern
         ? names
             .filter((name) => endPattern.test(name))
-            .sort((left, right) => Number(left.match(/_(\d+)_M$/i)?.[1]) - Number(right.match(/_(\d+)_M$/i)?.[1]))
+            .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }))
         : item.endClip && available.has(item.endClip) ? [item.endClip] : [];
       const mappedOrigin = Array.isArray(item.origin)
         ? { x: item.origin[0] ?? 0, y: item.origin[1] ?? 0 }
@@ -931,6 +944,11 @@
   }
 
   function returnToIdle() {
+    if (stage2Timer) {
+      clearTimeout(stage2Timer);
+      stage2Timer = undefined;
+    }
+    isInStage2 = false;
     if (!character) return;
     stopVoice();
     targetOffset = { x: 0, y: 0 };
@@ -1054,37 +1072,24 @@
               if (entry.trackIndex !== 1) return;
               if (entry === activeTalkEntry) {
                 if (activeInteraction === "hold" && activeInteractionSpec) {
-                  if (activeFrameIndex < activeInteractionSpec.frames.length - 1) {
-                    activeFrameIndex += 1;
-                    playInteractionFrame(
-                      activeInteractionSpec.frames[activeFrameIndex],
-                      activeInteraction,
-                      false,
-                    );
+                  const stage2Frames = activeInteractionSpec.frames.filter((f) => /2_\d+_M$/i.test(f));
+                  const stage1Frames = activeInteractionSpec.frames.filter((f) => !/2_\d+_M$/i.test(f));
+                  if (!isInStage2) {
+                    const loopFrame = stage1Frames[1] || stage1Frames[0];
+                    if (loopFrame && animationName !== loopFrame) {
+                      playInteractionFrame(loopFrame, "hold", true);
+                    }
                   } else {
-                    playInteractionFrame(
-                      activeInteractionSpec.frames[activeFrameIndex],
-                      activeInteraction,
-                      true,
-                    );
+                    const loop2Frame = stage2Frames[1] || stage2Frames[0];
+                    if (loop2Frame && animationName !== loop2Frame) {
+                      playInteractionFrame(loop2Frame, "hold", true);
+                    }
                   }
                   return;
                 }
                 if (activeInteraction === "release") {
-                  if (
-                    activeInteractionSpec &&
-                    activeFrameIndex < activeInteractionSpec.endFrames.length - 1
-                  ) {
-                    activeFrameIndex += 1;
-                    playInteractionFrame(
-                      activeInteractionSpec.endFrames[activeFrameIndex],
-                      "release",
-                      false,
-                    );
-                  } else {
-                    releaseVisualCompleted = true;
-                    finishRelease();
-                  }
+                  releaseVisualCompleted = true;
+                  finishRelease();
                   return;
                 }
                 if (loopAnimation) return;
@@ -1101,17 +1106,14 @@
         app?.stage.addChildAt(spine, 0);
       }
       if (!character) throw new Error(`No skeleton loaded for ${modelId}`);
-      const width = Math.max(character.width, 1);
-      const height = Math.max(character.height, 1);
-      scale =
-        Math.ceil(
-          Math.max(window.innerWidth / width, window.innerHeight / height) * 10,
-        ) / 10;
+      const skelWidth = character.skeleton.data.width || 1920;
+      const skelHeight = character.skeleton.data.height || 1080;
+      scale = Number(Math.max(window.innerWidth / skelWidth, window.innerHeight / skelHeight).toFixed(3));
       for (const spine of app?.stage.children ?? []) {
         if (spine === lobbyEffectOverlay || spine === lobbyDustLayer || spine instanceof PIXI.Graphics) continue;
         spine.scale.set(scale);
-        spine.x = window.innerWidth / 2;
-        spine.y = window.innerHeight;
+        spine.x = currentOffsetX;
+        spine.y = currentOffsetY;
       }
       const effectManifest = await loadEffectManifest();
       if (ownGeneration !== generation) return;
@@ -1121,9 +1123,12 @@
       if (ownGeneration !== generation) return;
 
       // Start L2D animation instantly after effect is initialized
-      const startAnimation = animations.find((name) =>
+      let startAnimation = animations.find((name) =>
         name.toLowerCase() === "start_idle_01",
       );
+      if (modelId === "ch0184_home" && animations.some((n) => /^Start_Idle_02$/i.test(n))) {
+        startAnimation = animations.find((n) => /^Start_Idle_02$/i.test(n));
+      }
       const idle = idleAnimationName() ?? animations.find((name) => /^Idle/i.test(name));
       if (startAnimation) {
         const startEntry = character.state.setAnimation(0, startAnimation, false);
@@ -1349,9 +1354,11 @@
     if (!character || !app) return undefined;
     const rect = canvas.getBoundingClientRect();
     if (!rect.width || !rect.height) return undefined;
+    const screenWidth = app.screen?.width || app.renderer.width;
+    const screenHeight = app.screen?.height || app.renderer.height;
     return new PIXI.Point(
-      ((clientX - rect.left) * app.renderer.width) / rect.width,
-      ((clientY - rect.top) * app.renderer.height) / rect.height,
+      ((clientX - rect.left) * screenWidth) / rect.width,
+      ((clientY - rect.top) * screenHeight) / rect.height,
     );
   }
 
@@ -1375,9 +1382,11 @@
     if (!point) return undefined;
     character.skeletonToPixiWorldCoordinates(point);
     const rect = canvas.getBoundingClientRect();
+    const screenWidth = app.screen?.width || app.renderer.width;
+    const screenHeight = app.screen?.height || app.renderer.height;
     return {
-      x: rect.left + (point.x / app.renderer.width) * rect.width,
-      y: rect.top + (point.y / app.renderer.height) * rect.height,
+      x: rect.left + (point.x / screenWidth) * rect.width,
+      y: rect.top + (point.y / screenHeight) * rect.height,
     };
   }
 
@@ -1439,11 +1448,27 @@
     targetOffset = { x: 0, y: 0 };
     lastOffsetFrameAt = 0;
     activeFrameIndex = 0;
+    if (stage2Timer) {
+      clearTimeout(stage2Timer);
+      stage2Timer = undefined;
+    }
+    isInStage2 = false;
     setIdleBase();
     stopVoice();
     isTalking = true;
     canStartTalk = false;
-    playInteractionFrame(pending.interaction.frames[0], "hold", false);
+    const stage2Frames = pending.interaction.frames.filter((f) => /2_\d+_M$/i.test(f));
+    const stage1Frames = pending.interaction.frames.filter((f) => !/2_\d+_M$/i.test(f));
+    const initialFrame = stage1Frames[0] || pending.interaction.frames[0];
+    playInteractionFrame(initialFrame, "hold", false);
+    if (stage2Frames.length > 0) {
+      stage2Timer = setTimeout(() => {
+        if (activeInteraction === "hold" && activeInteractionSpec && !isInStage2) {
+          isInStage2 = true;
+          playInteractionFrame(stage2Frames[0], "hold", false);
+        }
+      }, 3000);
+    }
     pending.startBoneGlobal = new PIXI.Point(
       activeBone.worldX,
       activeBone.worldY,
@@ -1457,9 +1482,11 @@
     if (!character || !activeInteractionSpec || !activeBone || !pendingPointer) return;
     const rect = canvas.getBoundingClientRect();
     if (!pendingPointer.startBoneGlobal) return;
+    const screenWidth = app!.screen?.width || app!.renderer.width;
+    const screenHeight = app!.screen?.height || app!.renderer.height;
     const startBoneCss = {
-      x: pendingPointer.startBoneGlobal.x / app!.renderer.width * rect.width + rect.left,
-      y: pendingPointer.startBoneGlobal.y / app!.renderer.height * rect.height + rect.top,
+      x: pendingPointer.startBoneGlobal.x / screenWidth * rect.width + rect.left,
+      y: pendingPointer.startBoneGlobal.y / screenHeight * rect.height + rect.top,
     };
     const cssDistanceX = pendingPointer.latestCss.x - (startBoneCss.x - rect.left);
     const cssDistanceY = pendingPointer.latestCss.y - (startBoneCss.y - rect.top);
@@ -1474,8 +1501,8 @@
     const clampedDistanceX = distanceX * ratio;
     const clampedDistanceY = distanceY * ratio;
     const clampedGlobal = new PIXI.Point(
-      pendingPointer.startBoneGlobal.x + clampedDistanceX / rect.width * app!.renderer.width,
-      pendingPointer.startBoneGlobal.y + clampedDistanceY / rect.height * app!.renderer.height,
+      pendingPointer.startBoneGlobal.x + clampedDistanceX / rect.width * screenWidth,
+      pendingPointer.startBoneGlobal.y + clampedDistanceY / rect.height * screenHeight,
     );
     const spec = activeInteractionSpec;
     const local = pointInBoneSpace(clampedGlobal, activeBone);
@@ -1502,6 +1529,10 @@
 
   function finishHeldInteraction() {
     const interaction = activeInteractionSpec;
+    if (stage2Timer) {
+      clearTimeout(stage2Timer);
+      stage2Timer = undefined;
+    }
     activePointerId = null;
     targetOffset = { x: 0, y: 0 };
     if (!character || activeInteraction !== "hold") return;
@@ -1511,14 +1542,21 @@
     }
     isTalking = true;
     canStartTalk = false;
-    activeFrameIndex = 0;
+
+    // Play ONLY the corresponding end frame
+    let targetEnd = interaction.endFrames[0];
+    if (isInStage2) {
+      const stage2End = interaction.endFrames.find((f) => /End2/i.test(f));
+      if (stage2End) targetEnd = stage2End;
+    } else {
+      const stage1End = interaction.endFrames.find((f) => !/End2/i.test(f));
+      if (stage1End) targetEnd = stage1End;
+    }
+    isInStage2 = false;
+
     releaseVisualCompleted = false;
-    releaseActionCompleted =
-      !activeInteractionSpec?.endFrames.some((endFrame) => {
-        const action = `${endFrame.slice(0, -2)}_A`;
-        return character?.state.data.skeletonData.findAnimation(action);
-      });
-    playInteractionFrame(interaction.endFrames[0], "release", false);
+    releaseActionCompleted = !character.state.data.skeletonData.findAnimation(`${targetEnd.slice(0, -2)}_A`);
+    playInteractionFrame(targetEnd, "release", false);
   }
 
   function onPointerDown(event: PointerEvent) {
@@ -1572,11 +1610,13 @@
       if (activePointerId === event.pointerId) {
         finishHeldInteraction();
       } else {
+        const screenWidth = app!.screen?.width || app!.renderer.width;
+        const screenHeight = app!.screen?.height || app!.renderer.height;
         const distance = Math.hypot(
           event.clientX - (canvas.getBoundingClientRect().left +
-            (pending.startGlobal.x / app!.renderer.width) * canvas.getBoundingClientRect().width),
+            (pending.startGlobal.x / screenWidth) * canvas.getBoundingClientRect().width),
           event.clientY - (canvas.getBoundingClientRect().top +
-            (pending.startGlobal.y / app!.renderer.height) * canvas.getBoundingClientRect().height),
+            (pending.startGlobal.y / screenHeight) * canvas.getBoundingClientRect().height),
         );
         if (allowTap && !pending.held && distance < 8) playNextTalk();
       }
@@ -1619,7 +1659,7 @@
     howl = new Howl({
       src: [`${root}/${voice}`],
       volume: Math.max(0, Math.min(1, voiceVolume)),
-      onloaderror: (_id, error) => console.error(`Voice clip unavailable (${voiceLocale}):`, error),
+      onloaderror: (_id: any, error: any) => console.error(`Voice clip unavailable (${voiceLocale}):`, error),
     });
     howl.play();
   }
@@ -1627,13 +1667,19 @@
   export function setScale(value: number) {
     if (!Number.isFinite(value) || value <= 0) return;
     scale = value;
-    app?.stage.children.forEach((child) => child.scale.set(scale));
+    app?.stage.children.forEach((child) => {
+      if (child === lobbyEffectOverlay || child === lobbyDustLayer || child instanceof PIXI.Graphics) return;
+      child.scale.set(scale);
+    });
     onscale?.({ value });
   }
 
   export function setOffset(x: number, y: number) {
     if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+    currentOffsetX = x;
+    currentOffsetY = y;
     app?.stage.children.forEach((child) => {
+      if (child === lobbyEffectOverlay || child === lobbyDustLayer || child instanceof PIXI.Graphics) return;
       child.x = x;
       child.y = y;
     });
@@ -1641,13 +1687,57 @@
 
   export function fitToScreen(mode: "fit" | "fill") {
     if (!character || !app) return;
-    const width = Math.max(character.width / scale, 1);
-    const height = Math.max(character.height / scale, 1);
+    const skelWidth = character.skeleton.data.width || 1920;
+    const skelHeight = character.skeleton.data.height || 1080;
     const ratio =
       mode === "fill"
-        ? Math.max(app.renderer.width / width, app.renderer.height / height)
-        : Math.min(app.renderer.width / width, app.renderer.height / height);
-    setScale(Math.ceil(ratio * 100) / 100);
+        ? Math.max(app.renderer.width / skelWidth, app.renderer.height / skelHeight)
+        : Math.min(app.renderer.width / skelWidth, app.renderer.height / skelHeight);
+    setScale(Number(ratio.toFixed(3)));
+  }
+
+  let showInteractionZones = $state(false);
+  let interactionZoneTimeout: ReturnType<typeof setTimeout> | undefined;
+
+  export function flashInteractionZones(durationSec = 4) {
+    if (interactionZoneTimeout) clearTimeout(interactionZoneTimeout);
+    showInteractionZones = true;
+    interactionZoneTimeout = setTimeout(() => {
+      showInteractionZones = false;
+    }, durationSec * 1000);
+  }
+
+  const KIND_COLORS: Record<string, string> = {
+    pat: "#38bdf8",     // sky blue
+    touch: "#f43f5e",   // rose
+    cheek: "#f59e0b",   // amber
+    pinch: "#a855f7",   // purple
+    look: "#10b981",    // emerald
+  };
+
+  function getInteractionZoneDisplays() {
+    const seen = new Set<string>();
+    const displays = [];
+    for (let idx = 0; idx < interactions.length; idx++) {
+      const it = interactions[idx];
+      const center = interactionClientPosition(it);
+      if (!center) continue;
+      const boneName = it.anchor?.data?.name || `bone_${idx}`;
+      const comboKey = `${it.kind}-${boneName}`;
+      if (seen.has(comboKey)) continue;
+      seen.add(comboKey);
+      displays.push({
+        id: `${comboKey}-${idx}`,
+        kind: it.kind,
+        bone: boneName,
+        action: it.frames[0] || "",
+        x: Math.round(center.x),
+        y: Math.round(center.y),
+        radius: Math.round(Math.max(140, 180 * scale)),
+        color: KIND_COLORS[it.kind] || "#60a5fa",
+      });
+    }
+    return displays;
   }
 
   export function setMaxFPS(value: number) {
@@ -1664,6 +1754,29 @@
   onpointerup={(event) => onPointerUp(event)}
   onpointercancel={(event) => onPointerUp(event, false)}
 ></canvas>
+
+{#if showInteractionZones}
+  <div class="pointer-events-none fixed inset-0 z-20 overflow-hidden">
+    {#each getInteractionZoneDisplays() as zone (zone.id)}
+      <div
+        class="absolute -translate-x-1/2 -translate-y-1/2 rounded-full border-2 border-dashed flex flex-col items-center justify-center animate-pulse shadow-lg"
+        style="left: {zone.x}px; top: {zone.y}px; width: {zone.radius * 2}px; height: {zone.radius * 2}px; background-color: {zone.color}25; border-color: {zone.color};"
+      >
+        <span
+          class="rounded px-2 py-0.5 text-xs font-black tracking-wide text-white shadow-md"
+          style="background-color: {zone.color};"
+        >
+          {zone.kind.toUpperCase()}
+        </span>
+        {#if zone.bone}
+          <span class="mt-1 rounded bg-black/75 px-1.5 py-0.5 text-[10px] font-mono text-white/90">
+            {zone.bone}
+          </span>
+        {/if}
+      </div>
+    {/each}
+  </div>
+{/if}
 
 {#if playEffects && lobbyCssFlashVisible && lobbyCssFlashOpacity > 0.005}
   <div

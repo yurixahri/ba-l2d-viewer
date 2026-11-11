@@ -70,6 +70,8 @@
     p.set("scale", scale.toFixed(2));
     p.set("x", Math.round(offsetX).toString());
     p.set("y", Math.round(offsetY).toString());
+    p.set("w", window.innerWidth.toString());
+    p.set("h", window.innerHeight.toString());
     p.set("sub", showSubtitles ? "1" : "0");
     return `${window.location.origin}${window.location.pathname}?${p.toString()}`;
   });
@@ -175,30 +177,80 @@
           }
         }
 
+        const refW = params.has("w") ? parseFloat(params.get("w")!) : 1920;
+        const refH = params.has("h") ? parseFloat(params.get("h")!) : 1080;
+        const resScaleX = window.innerWidth / (refW > 0 ? refW : 1920);
+        const resScaleY = window.innerHeight / (refH > 0 ? refH : 1080);
+        const resScale = resScaleY;
+
         if (params.has("scale")) {
           const s = parseFloat(params.get("scale")!);
           if (s > 0) {
-            scale = s;
+            scale = Number((s * resScale).toFixed(3));
             customScaleSet = true;
           }
         }
         if (params.has("x")) {
           const px = parseFloat(params.get("x")!);
           if (!isNaN(px)) {
-            offsetX = px;
+            offsetX = Math.round(px * resScaleX);
             customOffsetSet = true;
           }
         }
         if (params.has("y")) {
           const py = parseFloat(params.get("y")!);
           if (!isNaN(py)) {
-            offsetY = py;
+            offsetY = Math.round(py * resScaleY);
             customOffsetSet = true;
           }
         }
 
         if (params.has("sub")) {
           showSubtitles = params.get("sub") === "1" || params.get("sub") === "true";
+        }
+
+        if (typeof window !== "undefined") {
+          window.wallpaperPropertyListener = {
+            applyUserProperties: (properties: Record<string, { value: unknown }>) => {
+              if (properties.model?.value) {
+                selectedModel = String(properties.model.value);
+              }
+              if (properties.scale?.value !== undefined) {
+                const s = parseFloat(String(properties.scale.value));
+                if (s > 0) {
+                  scale = s;
+                  stage?.setScale(scale);
+                }
+              }
+              if (properties.bgm?.value !== undefined) {
+                playBGM = Boolean(properties.bgm.value);
+              }
+              if (properties.bgm_vol?.value !== undefined) {
+                bgmVolume = parseFloat(String(properties.bgm_vol.value)) / 100;
+                if (bgm) bgm.volume(bgmVolume);
+              }
+              if (properties.voice?.value !== undefined) {
+                playVoice = Boolean(properties.voice.value);
+              }
+              if (properties.voice_vol?.value !== undefined) {
+                voiceVolume = parseFloat(String(properties.voice_vol.value)) / 100;
+              }
+              if (properties.sfx?.value !== undefined) {
+                playSfx = Boolean(properties.sfx.value);
+              }
+              if (properties.sfx_vol?.value !== undefined) {
+                sfxVolume = parseFloat(String(properties.sfx_vol.value)) / 100;
+              }
+              if (properties.effects?.value !== undefined) {
+                playEffects = Boolean(properties.effects.value);
+              }
+              if (properties.fps?.value !== undefined) {
+                const fps = parseInt(String(properties.fps.value), 10);
+                if (fps > 0) stage?.setMaxFPS(fps);
+              }
+            },
+            applyGeneralProperties: () => {},
+          };
         }
       }
     } catch (reason) {
@@ -232,10 +284,16 @@
     return null;
   });
 
+  let lastModel = $state("");
+
   $effect(() => {
+    const currentModel = selectedModel;
     const target = selectedBgm;
+    const modelChanged = currentModel !== lastModel;
+    lastModel = currentModel;
+
     if (playBGM && target?.path) {
-      if (activeBgmTrack !== target.path) {
+      if (activeBgmTrack !== target.path || !bgm) {
         bgm?.stop();
         activeBgmTrack = target.path;
         bgm = new Howl({
@@ -244,15 +302,21 @@
           loop: true,
           volume: bgmVolume,
           preload: true,
-          onloaderror: (_id, reason) => console.error("Failed to load lobby BGM:", reason),
-          onplayerror: (_id, reason) => {
+          onloaderror: (_id: any, reason: any) => console.error("Failed to load lobby BGM:", reason),
+          onplayerror: (_id: any, reason: any) => {
             console.warn("BGM autoplay blocked, retrying on unlock:", reason);
             bgm?.once("unlock", () => bgm?.play());
           },
         });
         bgm.play();
-      } else if (!bgm?.playing()) {
-        bgm?.play();
+      } else {
+        if (modelChanged) {
+          bgm.stop();
+          bgm.seek(0);
+          bgm.play();
+        } else if (!bgm.playing()) {
+          bgm.play();
+        }
       }
     } else if (!playBGM && bgm) {
       bgm.stop();
@@ -373,6 +437,9 @@
       <p class="text-xs text-slate-400">
         Click to play talk animations. Also you can interact with the model by clicking and dragging certain areas on it.
       </p>
+      <Button variant="outline" onclick={() => stage?.flashInteractionZones(5)}>
+        ⚡ Highlight interaction zones (5s)
+      </Button>
       <div class="rounded-md border border-white/10 bg-black/20 p-3 grid gap-3">
         <h2 class="text-sm font-semibold text-slate-200">Audio Settings</h2>
         <label class="flex items-center gap-3 text-sm text-slate-300">
@@ -503,6 +570,17 @@
       </div>
 
       <Button variant="outline" onclick={() => (settingsOpen = false)}>Close settings</Button>
+
+      <div class="pt-3 text-center border-t border-white/10">
+        <a
+          href="https://github.com/yurixahri/ba-l2d-viewer"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="text-xs text-slate-400 hover:text-slate-200 underline"
+        >
+          GitHub Repository
+        </a>
+      </div>
     </div>
   </aside>
 
@@ -517,4 +595,18 @@
       {:else}<p class="max-w-2xl text-red-200">{error}</p>{/if}
     </div>
   {/if}
+
+  <div class="fixed bottom-3 right-4 z-10">
+    <a
+      href="https://github.com/yurixahri/ba-l2d-viewer"
+      target="_blank"
+      rel="noopener noreferrer"
+      class="flex items-center gap-1.5 rounded-full border border-white/10 bg-black/40 px-3 py-1 text-xs text-slate-400 backdrop-blur-sm transition-colors hover:bg-black/60 hover:text-white"
+    >
+      <svg class="h-3.5 w-3.5 fill-current" viewBox="0 0 24 24" aria-hidden="true">
+        <path fill-rule="evenodd" clip-rule="evenodd" d="M12 2C6.477 2 2 6.484 2 12.017c0 4.425 2.865 8.18 6.839 9.504.5.092.682-.217.682-.483 0-.237-.008-.868-.013-1.703-2.782.605-3.369-1.343-3.369-1.343-.454-1.158-1.11-1.466-1.11-1.466-.908-.62.069-.608.069-.608 1.003.07 1.53 1.032 1.53 1.032.892 1.53 2.341 1.088 2.91.832.092-.647.35-1.088.636-1.338-2.22-.253-4.555-1.113-4.555-4.951 0-1.093.39-1.988 1.029-2.688-.103-.253-.446-1.272.098-2.65 0 0 .84-.27 2.75 1.026A9.564 9.564 0 0112 6.844c.85.004 1.705.115 2.504.337 1.909-1.296 2.747-1.027 2.747-1.027.546 1.379.202 2.398.1 2.651.64.7 1.028 1.595 1.028 2.688 0 3.848-2.339 4.695-4.566 4.943.359.309.678.92.678 1.855 0 1.338-.012 2.419-.012 2.747 0 .268.18.58.688.482A10.019 10.019 0 0022 12.017C22 6.484 17.522 2 12 2z" />
+      </svg>
+      <span>GitHub</span>
+    </a>
+  </div>
 </main>
