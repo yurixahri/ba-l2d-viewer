@@ -2,7 +2,7 @@
 
 base on [this](https://github.com/respectZ/blue-archive-viewer)
 
-preview at [http://ba_viewer.yurixahri.net](http://ba_viewer.yurixahri.net)
+preview at [https://ba-viewer.yurixahri.net](https://ba-viewer.yurixahri.net)
 
 ---
 ## Disclaimer & Legal Notice
